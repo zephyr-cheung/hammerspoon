@@ -16,10 +16,12 @@
 CODE_SIGN_ENTITLEMENTS = Hammerspoon/Hammerspoon.entitlements
 
 // Code Signing Identity
-// 上游这里是 `Developer ID Application` + `DEVELOPMENT_TEAM = VQCYSNZB89`（维护者的签名），
-// 在本机没有那个证书、会直接失败。custom 分支改成 ad-hoc（`-`）作为默认值，
-// 需要正式发布时在命令行覆盖即可：CODE_SIGN_IDENTITY="Developer ID Application" DEVELOPMENT_TEAM=VQCYSNZB89
-CODE_SIGN_IDENTITY = -
+// 上游这里是 `Developer ID Application` + `DEVELOPMENT_TEAM = VQCYSNZB89`（维护者的），
+// 本机没有那个证书会直接失败。custom 分支改用**本地自签名证书**（上游 CONTRIBUTING 推荐的
+// 做法：建一个名为 `Internal Code Signing` 的代码签名证书）—— 签名身份固定，重编后
+// 辅助功能授权不会掉，不用每次重新勾。证书用钥匙串访问的「证书助理 → 创建证书…」自建，免费。
+// 没有该证书的环境在命令行覆盖成 ad-hoc 即可：CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=
+CODE_SIGN_IDENTITY = Internal Code Signing
 DEVELOPMENT_TEAM =
 
 #include? "../../../Hammerspoon-Downstream.xcconfig"

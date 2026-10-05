@@ -46,10 +46,14 @@ open build/Build/Products/Release/Hammerspoon.app
 - **不要用 `scripts/rebuild.sh`。** 它里面有 `killall Hammerspoon` + `open`：如果 Hammerspoon
   正是你的窗口管理器（本机就是，跑 PaperWM），它会把你正在用的实例直接杀掉。只用上面的
   `xcodebuild`，产物落在 `build/`，何时替换 `/Applications/Hammerspoon.app` 自己决定。
-- **ad-hoc 签名 → 每次重编都要重新授权辅助功能。** 二进制一变，macOS 就当成新 app，
-  Accessibility 授权得重新给一遍。要避免就按上游 `CONTRIBUTING.md` 建一个自签名证书
-  （如叫 `Internal Code Signing`），再把配置里的 `CODE_SIGN_IDENTITY` 指过去 ——
-  这样重编后权限还在。
+- **签名：本分支默认用本地自签名证书 `Internal Code Signing`**（三个 Release xcconfig 都设了）。
+  好处是签名身份固定 → **重编后辅助功能授权不会掉**；ad-hoc 签名则二进制一变就被 macOS
+  当成新 app，每次重编都要重新授权。
+  证书免费，自己生成即可：**钥匙串访问 → 证书助理 → 创建证书…**（名称 `Internal Code Signing`、
+  身份类型「自签名根证书」、证书类型「代码签名」），建好后双击它 → 信任 → 把「代码签名」
+  设为「始终信任」，再用 `security find-identity -v -p codesigning` 确认能看到它。
+  换到没建该证书的机器时，在命令行覆盖成 ad-hoc 即可：
+  `xcodebuild ... CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= build`
 
 ## 说明
 

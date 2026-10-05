@@ -14,8 +14,9 @@
 // Code Signing Identity
 // custom: 上游这里是 `Developer ID Application` + `DEVELOPMENT_TEAM = VQCYSNZB89`（维护者的），
 // 本机没有该证书，编 Release 会报 "No signing certificate ... found" 直接失败。
-// 改成 ad-hoc 作为默认，要正式签名时在命令行覆盖即可。
-CODE_SIGN_IDENTITY = -
+// 改用本地自签名证书 `Internal Code Signing`（身份固定 → 重编后辅助功能授权不掉）；
+// 没有该证书时命令行覆盖：CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=
+CODE_SIGN_IDENTITY = Internal Code Signing
 DEVELOPMENT_TEAM =
 
 // Preprocessor Macros
