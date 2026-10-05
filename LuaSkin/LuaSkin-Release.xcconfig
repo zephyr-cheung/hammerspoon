@@ -12,8 +12,11 @@
 #include "LuaSkin-Base.xcconfig"
 
 // Code Signing Identity
-CODE_SIGN_IDENTITY = Developer ID Application
-DEVELOPMENT_TEAM = VQCYSNZB89
+// custom: 上游这里是 `Developer ID Application` + `DEVELOPMENT_TEAM = VQCYSNZB89`（维护者的），
+// 本机没有该证书，编 Release 会报 "No signing certificate ... found" 直接失败。
+// 改成 ad-hoc 作为默认，要正式签名时在命令行覆盖即可。
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
 
 // Preprocessor Macros
 GCC_PREPROCESSOR_DEFINITIONS =
