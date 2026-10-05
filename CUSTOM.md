@@ -24,10 +24,23 @@
    注意：这些属性**不是构建设置**（`-showBuildSettings` 里查不到
    `ENABLE_ADDRESS_SANITIZER`），命令行覆盖无效，只能改 scheme 文件。
 
-3. **Release 配置的签名默认值改成 ad-hoc。** 上游写死了
+3. **Release 配置的签名默认值改成本地自签名证书。** 上游写死了
    `CODE_SIGN_IDENTITY = Developer ID Application` + `DEVELOPMENT_TEAM = VQCYSNZB89`
-   （维护者的证书），本机没有，编 Release 会失败。已改成 `CODE_SIGN_IDENTITY = -`、
+   （维护者的证书），本机没有，编 Release 会失败。三个 Release xcconfig
+   （`Hammerspoon/Build Configs/Hammerspoon-Release.xcconfig`、`Project-Release.xcconfig`、
+   `LuaSkin/LuaSkin-Release.xcconfig`）都改成 `CODE_SIGN_IDENTITY = Internal Code Signing`、
    `DEVELOPMENT_TEAM =`（空），原值留在注释里；要正式签名时在命令行覆盖即可。
+
+4. **动画里的写帧优化（`extensions/window/window.lua`）。** 上游每帧每窗口固定 3 次 AX 写
+   （size → position → size）。本分支在动画开始时比较起止宽高：只位移的那类动画，
+   中间帧只写一次位置，每帧省 2 次 AX 写；终帧仍写完整帧。**单窗口刷新率与上游完全一致**，
+   判断只用已经读到的实际帧，不额外读 AX。
+
+   曾经还有第二处改动「每次心跳最多重排 N 个窗口」的轮转限流（默认 3），已**废弃并移除**。
+   它的实测代价：6 窗口下每窗口 34.0–34.1ms 一帧（≈29fps），放开限流是 16.9–17.0ms（≈59fps），
+   观感明显变顿。它换来的收益（主线程 >8ms 停顿次数）重复测量极不稳定 —— 同一配置量到过
+   21 次和 2 次。等于用一个测不准的收益换掉一个确定的损失。
+   教训：**优化动画时别只量主线程停顿次数，要量单窗口帧率。**
 
 ## 怎么编
 
