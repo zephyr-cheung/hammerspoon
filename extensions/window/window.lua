@@ -271,20 +271,55 @@ local function quadOut(x,s,len)
   local l=1-max(0,min(1,(x-s)/len))
   return 1-l*l
 end
+-- custom: 每次心跳最多重排几个「进行中」的窗口（轮转处理）。
+-- 实测（受控压力测试，6 窗口）：主导主线程停顿的是**每次心跳的 AX 往返数** ——
+-- 每窗口每帧 3 次写 → >8ms 停顿 120–139 次；≤6 次往返 → 13–19 次。
+-- 3 ≈ 每个窗口 50fps（6 窗口两轮走完）。调小更省但单窗口更顿，调大更顺但停顿回升。
+-- 运行时可在 Hammerspoon 控制台改 _G.HammerspoonMaxWindowsPerTick 立刻试不同值，无需重编。
+local DEFAULT_MAX_WINDOWS_PER_TICK = 3
+local animCursor = 1
+local function maxWindowsPerTick()
+  local n = rawget(_G, "HammerspoonMaxWindowsPerTick")
+  if type(n) == "number" and n >= 1 then return math.floor(n) end
+  return DEFAULT_MAX_WINDOWS_PER_TICK
+end
 local function animate()
   local time = timer.secondsSinceEpoch()
-  for id,anim in pairs(animations) do
-    local r = quadOut(time,anim.time,anim.duration)
-    local f = {}
-    if r>=1 then
-      f=anim.endFrame
+  local ids = {}
+  for id in pairs(animations) do ids[#ids+1] = id end
+  table.sort(ids) -- 顺序稳定，轮转才公平
+  -- 1) 到期的动画一次处理完：最终帧必须按时落下，不能被限流推迟
+  local active = {}
+  for _,id in ipairs(ids) do
+    local anim = animations[id]
+    if quadOut(time,anim.time,anim.duration) >= 1 then
+      if anim.window then anim.window:_setFrame(anim.endFrame) end
       animations[id] = nil
     else
-      for _,k in pairs{'x','y','w','h'} do
+      active[#active+1] = id
+    end
+  end
+  -- 2) 进行中的按轮转，本次最多 N 个
+  local m = #active
+  if m > 0 then
+    local limit = maxWindowsPerTick()
+    if animCursor > m then animCursor = 1 end
+    local i, done = animCursor, 0
+    while done < limit and done < m do
+      local anim = animations[active[i]]
+      local r = quadOut(time,anim.time,anim.duration)
+      local f = {}
+      for _,k in ipairs{'x','y','w','h'} do
         f[k] = anim.startFrame[k] + (anim.endFrame[k]-anim.startFrame[k])*r
       end
+      if anim.window then anim.window:_setFrame(f) end
+      done = done + 1
+      i = i + 1
+      if i > m then i = 1 end
     end
-    anim.window:_setFrame(f)
+    animCursor = i
+  else
+    animCursor = 1
   end
   if not next(animations) then animTimer:setNextTrigger(DISTANT_FUTURE) end
 end
