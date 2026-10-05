@@ -41,9 +41,9 @@
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES"
-      enableAddressSanitizer = "YES"
-      enableASanStackUseAfterReturn = "YES"
-      enableUBSanitizer = "YES">
+      enableAddressSanitizer = "NO"
+      enableASanStackUseAfterReturn = "NO"
+      enableUBSanitizer = "NO">
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"

@@ -16,7 +16,10 @@
 CODE_SIGN_ENTITLEMENTS = Hammerspoon/Hammerspoon.entitlements
 
 // Code Signing Identity
-CODE_SIGN_IDENTITY = Developer ID Application
-DEVELOPMENT_TEAM = VQCYSNZB89
+// 上游这里是 `Developer ID Application` + `DEVELOPMENT_TEAM = VQCYSNZB89`（维护者的签名），
+// 在本机没有那个证书、会直接失败。custom 分支改成 ad-hoc（`-`）作为默认值，
+// 需要正式发布时在命令行覆盖即可：CODE_SIGN_IDENTITY="Developer ID Application" DEVELOPMENT_TEAM=VQCYSNZB89
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
 
 #include? "../../../Hammerspoon-Downstream.xcconfig"

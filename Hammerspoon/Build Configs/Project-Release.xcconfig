@@ -12,8 +12,10 @@
 #include "Project-Base.xcconfig"
 
 // Code Signing Identity
-CODE_SIGN_IDENTITY = Developer ID Application
-DEVELOPMENT_TEAM = VQCYSNZB89
+// 同 Hammerspoon-Release.xcconfig：上游用维护者的 Developer ID，custom 分支默认改 ad-hoc，
+// 要正式签名就在命令行覆盖 CODE_SIGN_IDENTITY / DEVELOPMENT_TEAM。
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
 
 // Build Active Architecture Only
 ONLY_ACTIVE_ARCH = NO
