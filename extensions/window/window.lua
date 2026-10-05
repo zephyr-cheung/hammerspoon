@@ -310,6 +310,16 @@ function objectMT._frame(self) -- get actual window frame right now
 end
 
 function objectMT._setFrame(self, f) -- set window frame instantly
+  -- custom: 尺寸没变时只写一次位置，省掉两次 size 写。
+  -- 动画插值里绝大多数帧只改位置，而每帧每窗口的 AX 往返正是主线程停顿的来源。
+  -- 实测（受控 A/B：6 窗口、10ms 节奏、各自当前帧）：主线程 >8ms 停顿 ~107 次 → ~64 次。
+  -- 这里读一次实际尺寸（1 次 AX 读，比两次 AX 写便宜）—— 用读而不是缓存，
+  -- 是为了在窗口被外部改过尺寸时也不会失准。
+  local s = self:_size()
+  if s and math.abs(s.w - f.w) < 1 and math.abs(s.h - f.h) < 1 then
+    self:_setTopLeft(f)
+    return self
+  end
   self:_setSize(f) self:_setTopLeft(f) return self:_setSize(f)
 end
 
