@@ -68,6 +68,31 @@ open build/Build/Products/Release/Hammerspoon.app
   换到没建该证书的机器时，在命令行覆盖成 ad-hoc 即可：
   `xcodebuild ... CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= build`
 
+## 另一个分支：`backport-trial-1.1.0`（素材库，不要直接用）
+
+把上游 `1.0.0..1.1.0` 里挑出来的 31 笔提交放在一起（顶端 `45961392`，基底 1.0.0）。
+它不是给日用的，是备着以后想「真正压低每帧的 AX 往返」时取材用。其中跟窗口动画
+直接相关的两笔是：
+
+- `b362b2aa` add setFrame method that disables enhanced UI during the move
+- `a31ffea7` replace lua setFrame with internal implementation
+
+这两笔把「取帧 / 写帧」从 Lua 搬进 ObjC —— 那才是正路；在 Lua 侧做限流之类的取巧
+已经证明是错的（见上面第 4 条）。当初试编过：在 Xcode 14.2 上能出产物，运行时探针也
+确认 backport 的代码真的被加载了（`window_filter.lua` 2325 行 vs 原版 2310 行）。
+**没有合进 `custom`**，要用就在这个分支上开工。
+
+排除在外的坑（都别跟）：
+
+- `b3ca3cf7`（hs.wifi 弃用修复）用了 macOS 13 才有的 `CWWiFiClient.interfaceNames`，
+  在 12.6 上编不过。已确认它不在本分支里。
+- 上游那段区间里的 4 笔 pod 升级会把 Sentry 8.32 升到 8.52 —— 那正是 1.1.0 在 12.6 上
+  dyld 加载失败（`Symbol not found: _$s10Foundation10URLRequestVMn`）的根源。已排除。
+- `e303ca7c` 把 deployment target 抬到 13.0，也排除。
+
+一个小提醒：这个分支是在当时那版 `custom` 上开出来的，签名还是 ad-hoc 那版
+（`4e03e91a` 的自签名证书在它之后）—— 直接编的话，重编一次就会掉辅助功能授权。
+
 ## 说明
 
 本分支的改动只为「在本机 12.6 + Xcode 14.2 上编译并日用」，不打算回上游。
