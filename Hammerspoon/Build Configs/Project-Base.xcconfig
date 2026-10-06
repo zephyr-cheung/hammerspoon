@@ -21,7 +21,9 @@ DEBUG_INFORMATION_FORMAT = dwarf-with-dsym
 // Other Warning Flags
 WARNING_CFLAGS = -Wno-unknown-warning-option -Wno-cstring-format-directive -Wno-padded -Wno-objc-missing-property-synthesis -Wno-auto-import -Wno-gnu-statement-expression -Wno-reserved-id-macro -Wno-gnu-zero-variadic-macro-arguments -Wno-objc-messaging-id -Wno-declaration-after-statement -Wno-deprecated-non-prototype
 // Other Linker Flags
-OTHER_LDFLAGS = -undefined dynamic_lookup
+// custom: CoreVideo 用于窗口动画驱动（CVDisplayLink 按显示器刷新节拍驱动逐帧插值与 AX 写，
+// 把逐帧工作搬离主线程）。上游没链接它，这里显式加上；sourceTree 上是 SDK 自带框架。
+OTHER_LDFLAGS = -undefined dynamic_lookup -framework CoreVideo
 // Enable Testability
 ENABLE_TESTABILITY = YES
 // Strip Debug Symbols During Copy

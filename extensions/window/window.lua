@@ -260,50 +260,124 @@ function objectMT.isVisible(self)
 end
 
 
-local animations, animTimer = {}
-local DISTANT_FUTURE=315360000 -- 10 years (roughly)
---[[ local function quad(x,s,len)
-       local l=max(0,min(2,(x-s)*2/len))
-       if l<1 then return l*l/2
-       else l=2-l return 1-(l*l/2) end
-     end --]]
-local function quadOut(x,s,len)
-  local l=1-max(0,min(1,(x-s)/len))
-  return 1-l*l
+-- custom: 逐帧插值与 AX 写现在由 ObjC 侧的 CVDisplayLink 驱动完成（见 libwindow.m 的
+-- 「custom: off-main-thread, display-link paced animation driver」）。Lua 这边只负责
+-- 记账（哪些窗口在动画、目标帧是什么）并把整份清单交给驱动，以及收到「这批跑完了」
+-- 之后做善后。之前那套「Lua 主线程 17ms 定时器逐帧算 + 逐帧写 AX」已经删掉：
+-- 它的步进会被 PaperWM 的重排、事件回调、GC 推迟，而且 17ms 与 60Hz 的 16.67ms 不同源。
+local animations = {}
+-- custom: 「动画在飞」的对外信号，给窗口管理器类插件（PaperWM）用。
+-- 动画是逐帧写 AX 实现的，每次写都会 raise windowMoved / windowResized（实测：0.3 秒的
+-- 一次动画，单窗口就能发出 33 次通知）。如果那些事件被当成「用户挪了窗口」进而触发重排，
+-- 就形成「写帧 → 事件 → 重排 → 又写帧」的自激风暴。上游只能靠「关监视器 +
+-- animationDuration+0.02 秒后无条件开回来」这个盲开来躲，而且那个恢复定时器的返回值
+-- 没有被持有 —— Hammerspoon 的 timer 被 GC 时会 stop，所以监视器常常再也回不来。
+-- 有了下面这两个 API，外部可以改成「监视器不关，动画在飞期间把这类事件丢掉，
+-- 等动画全部落地再做一次合并重排」，既不猜时间，也不会把监视器弄丢。
+local idleCallbacks, idleScheduled, idleTimer = {}, false, nil
+
+local function animationCount()
+  local n = 0
+  for _ in pairs(animations) do n = n + 1 end
+  -- 驱动线程自己的计数可能更多（已跑完但还没回主线程上报的那些），取大者更保守
+  local c = window._animActive and window._animActive() or 0
+  if c > n then n = c end
+  return n
 end
--- custom: 限流已废弃，不再使用。曾经这里做过「每次心跳最多重排 N 个窗口」的轮转限流，
--- 它确实降低了每拍的 AX 往返数，但代价是单窗口刷新率成比例下降 —— 6 窗口 / N=3 时
--- 实测每窗口 34.0–34.1ms 一帧（≈29fps），而放开限流是 16.9–17.0ms（≈59fps），观感明显变顿。
--- 而且当时用来衡量收益的「主线程 >8ms 停顿次数」本身极不稳定（同一配置重复跑量到过 21 次和 2 次），
--- 等于用一个测不准的收益换掉一个确定的损失。现在每拍处理全部动画，速度改由
--- 「减少每帧的 AX 写次数」来省（见下面 sizeChanges 分支）。
-local function animate()
-  local time = timer.secondsSinceEpoch()
-  for id,anim in pairs(animations) do
-    local r = quadOut(time,anim.time,anim.duration)
-    local f = {}
-    local final = r >= 1
-    if final then
-      f=anim.endFrame
-      animations[id] = nil
-    else
-      for _,k in pairs{'x','y','w','h'} do
-        f[k] = anim.startFrame[k] + (anim.endFrame[k]-anim.startFrame[k])*r
-      end
+
+local function notifyWhenIdle()
+  -- 推迟到下一轮 runloop 再回调：回调里要重查一次，因为 setFrame 换目标时会先
+  -- stopAnimation（集合短暂空）再 setFrameAnimated，不能把那一瞬间的空当成动画结束。
+  --
+  -- idleTimer 必须被持有 —— 不持有 doAfter 的返回值，回调就不会来（见上面那段注释）。
+  if idleScheduled then return end
+  idleScheduled = true
+  idleTimer = timer.doAfter(0, function()
+    idleScheduled, idleTimer = false, nil
+    if next(animations) ~= nil then return end
+    for fn in pairs(idleCallbacks) do
+      local ok, err = pcall(fn)
+      if not ok then print("hs.window animations-idle callback error: " .. tostring(err)) end
     end
-    -- custom: 整段动画的宽高都不变（纯位移）时，中间帧只需写一次位置，3 次 AX 写 → 1 次。
-    -- sizeChanges 在动画开始时算一次（见 setFrameAnimated），所以每帧不额外读 AX，
-    -- 单窗口刷新率与上游完全一致。终帧仍写完整帧，保证结束位置和尺寸都精确落到目标。
-    if final or anim.sizeChanges then
-      anim.window:_setFrame(f)
-    else
-      anim.window:_setTopLeft(f)
+  end)
+end
+
+-- custom: 把当前的动画清单整份交给 ObjC 驱动。调用时机是「集合发生变化」，
+-- 不是每帧 —— 每帧的插值在驱动线程上做。elapsed 由 Lua 给出起始进度，
+-- 之后由驱动按自己量到的 delta 推进（不跨时钟假设）。
+local function animSync()
+  local list = {}
+  local now = timer.secondsSinceEpoch()
+  for id, anim in pairs(animations) do
+    if anim.window then
+      list[#list+1] = {
+        window = anim.window,
+        id = id,
+        from = anim.startFrame,
+        to = anim.endFrame,
+        elapsed = now - anim.time,
+        duration = anim.duration,
+      }
     end
   end
-  if not next(animations) then animTimer:setNextTrigger(DISTANT_FUTURE) end
+  window._animSync(list)
 end
-animTimer = timer.new(0.017,animate)
-animTimer:start() --keep this split
+
+-- 驱动报回「这些窗口的动画已经落地」→ 从账上划掉；全空了就通知外部
+window._animOnFinish(function(finished)
+  for _, id in ipairs(finished) do animations[id] = nil end
+  if not next(animations) then notifyWhenIdle() end
+end)
+
+--- hs.window.animationsInFlight() -> number
+--- Function
+--- Returns how many window animations are currently in flight
+---
+--- Parameters:
+---  * None
+---
+--- Returns:
+---  * The number of in-flight animations; 0 means every window has settled at its target
+---
+--- Notes:
+---  * Animations are implemented by writing the window frame via Accessibility roughly every 17ms, and every one of those writes raises windowMoved/windowResized. Treating those events as external changes causes a feedback loop of "write frame -> event -> retile -> write frame", so ignore them while this is non-zero.
+---  * Use hs.window.addAnimationsIdleCallback() to run a single coalesced layout pass once the animations have finished.
+window.animationsInFlight = animationCount
+
+--- hs.window.addAnimationsIdleCallback(fn) -> hs.window
+--- Function
+--- Registers a callback invoked whenever window animations go from running to finished
+---
+--- Parameters:
+---  * fn - A function taking no arguments, called once each time the last in-flight animation ends
+---
+--- Returns:
+---  * The hs.window module
+---
+--- Notes:
+---  * The callback runs on the next pass of the run loop, so it is safe to lay windows out from within it.
+---  * Registering the same function twice only counts once; undo it with hs.window.removeAnimationsIdleCallback().
+window.addAnimationsIdleCallback = function(fn)
+  if type(fn) ~= "function" then
+    error("hs.window.addAnimationsIdleCallback: fn must be a function", 2)
+  end
+  idleCallbacks[fn] = true
+  return window
+end
+
+--- hs.window.removeAnimationsIdleCallback(fn) -> hs.window
+--- Function
+--- Unregisters a callback previously added with hs.window.addAnimationsIdleCallback()
+---
+--- Parameters:
+---  * fn - The function to unregister
+---
+--- Returns:
+---  * The hs.window module
+window.removeAnimationsIdleCallback = function(fn)
+  idleCallbacks[fn] = nil
+  return window
+end
 
 local function getAnimationFrame(win)
   local id = win:id()
@@ -315,8 +389,12 @@ local function stopAnimation(win,snap,id)
   local anim = animations[id]
   if not anim then return end
   animations[id] = nil
-  if not next(animations) then animTimer:setNextTrigger(DISTANT_FUTURE) end
+  -- custom: 先告诉驱动线程「这个窗口立刻失效」并同步新清单，再写终帧。
+  -- 驱动在每次写之前都会查这个标记，所以取消之后它绝不会再写回旧位置。
+  if window._animCancel then window._animCancel(id) end
+  animSync()
   if snap then win:_setFrame(anim.endFrame) end
+  if not next(animations) then notifyWhenIdle() end
 end
 
 function objectMT._frame(self) -- get actual window frame right now
@@ -333,10 +411,8 @@ local function setFrameAnimated(self,id,f,duration)
   local anim = animations[id]
   anim.time=timer.secondsSinceEpoch() anim.duration=duration
   anim.startFrame=frame anim.endFrame=f
-  -- custom: 起止宽高相同 ⇒ 整段只有位移 ⇒ 中间帧不必重复写尺寸（每帧省 2 次 AX 写）。
-  -- 只比较数值，不额外读 AX：frame 是上面刚读到的实际帧。
-  anim.sizeChanges = (frame.w ~= f.w) or (frame.h ~= f.h)
-  animTimer:setNextTrigger(0.01)
+  -- custom: sizeChanges 交给驱动算（它比较 from/to 的宽高），Lua 这边不再需要
+  animSync()
   return self
 end
 

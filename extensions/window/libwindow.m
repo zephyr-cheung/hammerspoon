@@ -1,5 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <Carbon/Carbon.h>
+#import <CoreVideo/CoreVideo.h>
+#import <os/lock.h>
 #import <LuaSkin/LuaSkin.h>
 #import "HSuicore.h"
 
@@ -751,6 +753,384 @@ static int userdata_gc(lua_State *L) {
     return 0;
 }
 
+#pragma mark - custom: off-main-thread, display-link paced animation driver
+//
+// 为什么：窗口动画原本由 Lua 在主线程上用 17ms 的 hs.timer 逐帧插值 + 逐帧写 AX。后果是
+//   · PaperWM 的重排（一次 ≈8ms，单是 visibleWindows() 就 7.77ms）、窗口事件回调、
+//     Lua GC 都会推迟动画步进；
+//   · 17ms 与 60Hz 的 16.67ms 不同源，步进落在刷新的哪个相位不固定 —— 这本身就是
+//     「不流畅」里最容易被看见的那部分。
+// 现在插值和 AX 写都跑在 CVDisplayLink 的回调线程上，按显示器刷新节拍驱动；主线程一个
+// 像素都不碰。动画全部落地后再 dispatch_async 回主线程，通知 Lua 做善后。
+//
+// 线程模型（要点：不让主线程等 AX）：
+//   · _items 只归 display link 回调线程所有；
+//   · 主线程只做两件轻活：_animSync 交一份新表、_animCancel 记一个「立刻失效」的 id；
+//   · 两个容器共用一把短锁 _lock，而回调线程在**同一把锁里**做每个窗口的 AX 写 ——
+//     主线程因此最多等一次 AX 写（实测 ~0.4ms），换来的是「取消之后绝不会再写这个窗口」
+//     这个确定语义（stopAnimation(snap=true) 紧接着要写终帧，不能被打回）。
+
+@interface HSAnimItem : NSObject
+@property (nonatomic, assign) AXUIElementRef element;
+@property (nonatomic, assign) int windowID;
+@property (nonatomic, assign) NSRect from;
+@property (nonatomic, assign) NSRect to;
+@property (nonatomic, assign) double elapsed;
+@property (nonatomic, assign) double duration;
+@property (nonatomic, assign) BOOL sizeChanges;
+@end
+
+@implementation HSAnimItem
+- (void)dealloc {
+    if (_element) { CFRelease(_element); }
+}
+@end
+
+@interface HSAnimDriver : NSObject
+@property (nonatomic, assign) CVDisplayLinkRef link;
+@property (nonatomic, strong) NSMutableArray<HSAnimItem *> *items;
+@property (nonatomic, strong) NSMutableArray<HSAnimItem *> *incoming;
+@property (nonatomic, strong) NSMutableSet<NSNumber *> *cancelled;
+@property (nonatomic, assign) os_unfair_lock lock;
+@property (nonatomic, assign) double lastTick;
+@property (nonatomic, assign) BOOL freshList;
+@property (nonatomic, assign) int32_t activeCount;
+@property (nonatomic, assign) int32_t generation;
+@property (nonatomic, assign) lua_State *L;
+@property (nonatomic, assign) int finishRef;
+- (void)syncWith:(NSMutableArray<HSAnimItem *> *)list;
+- (void)cancel:(int)windowID;
+- (int)activeCount;
+- (void)step;
+@end
+
+static double hsAnimNow(void) {
+    double freq = (double)CVGetHostClockFrequency();
+    return (freq > 0.0) ? ((double)CVGetCurrentHostTime() / freq) : 0.0;
+}
+
+// 与上游 Lua 那版完全一致的缓出曲线：l = 1 - t/len; r = 1 - l*l
+static double hsAnimQuadOut(double elapsed, double duration) {
+    if (duration <= 0.0) { return 1.0; }
+    double l = 1.0 - fmin(fmax(elapsed / duration, 0.0), 1.0);
+    return 1.0 - l * l;
+}
+
+static void hsAnimWritePos(AXUIElementRef el, NSRect f) {
+    CGPoint p = CGPointMake(f.origin.x, f.origin.y);
+    CFTypeRef v = AXValueCreate(kAXValueCGPointType, &p);
+    if (v) {
+        AXUIElementSetAttributeValue(el, (CFStringRef)NSAccessibilityPositionAttribute, v);
+        CFRelease(v);
+    }
+}
+
+static void hsAnimWriteSize(AXUIElementRef el, NSRect f) {
+    CGSize s = CGSizeMake(f.size.width, f.size.height);
+    CFTypeRef v = AXValueCreate(kAXValueCGSizeType, &s);
+    if (v) {
+        AXUIElementSetAttributeValue(el, (CFStringRef)NSAccessibilitySizeAttribute, v);
+        CFRelease(v);
+    }
+}
+
+// full = 上游那套 size → position → size 三步（终帧，以及宽高会变的动画）；
+// 否则只写位置：宽高不变的纯位移动画，每拍 AX 往返能从 3 次降到 1 次。
+static void hsAnimWriteFrame(AXUIElementRef el, NSRect f, BOOL full) {
+    if (!el) { return; }
+    if (full) { hsAnimWriteSize(el, f); }
+    hsAnimWritePos(el, f);
+    if (full) { hsAnimWriteSize(el, f); }
+}
+
+static CVReturn hsAnimDisplayLinkCallback(CVDisplayLinkRef link, const CVTimeStamp *now,
+                                         const CVTimeStamp *outputTime, CVOptionFlags flagsIn,
+                                         CVOptionFlags *flagsOut, void *context) {
+    (void)link; (void)now; (void)outputTime; (void)flagsIn; (void)flagsOut;
+    @autoreleasepool {
+        [(__bridge HSAnimDriver *)context step];
+    }
+    return kCVReturnSuccess;
+}
+
+@implementation HSAnimDriver
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _items = [NSMutableArray array];
+        _cancelled = [NSMutableSet set];
+        _lock = OS_UNFAIR_LOCK_INIT;
+        _finishRef = LUA_NOREF;
+        _L = NULL;
+    }
+    return self;
+}
+
+- (int)activeCount {
+    return (int)__atomic_load_n(&_activeCount, __ATOMIC_SEQ_CST);
+}
+
+- (void)ensureRunning {
+    if (!_link) {
+        if (CVDisplayLinkCreateWithActiveCGDisplays(&_link) != kCVReturnSuccess) {
+            _link = NULL;
+            NSLog(@"hs.window custom: CVDisplayLink 创建失败，动画将不推进");
+            return;
+        }
+        CVDisplayLinkSetOutputCallback(_link, hsAnimDisplayLinkCallback, (__bridge void *)self);
+    }
+    if (!CVDisplayLinkIsRunning(_link)) {
+        _lastTick = 0.0;
+        CVDisplayLinkStart(_link);
+    }
+}
+
+- (void)syncWith:(NSMutableArray<HSAnimItem *> *)list {
+    os_unfair_lock_lock(&_lock);
+    _incoming = list;
+    [_cancelled removeAllObjects];   // 新表是权威的：不在表里的动画自然消失
+    os_unfair_lock_unlock(&_lock);
+
+    __atomic_add_fetch(&_generation, 1, __ATOMIC_SEQ_CST);
+    [self ensureRunning];
+}
+
+- (void)cancel:(int)windowID {
+    // 只加一个标记；回调线程在每次写之前都会看它，所以取消对「后续任何一帧」立刻生效
+    os_unfair_lock_lock(&_lock);
+    [_cancelled addObject:@(windowID)];
+    os_unfair_lock_unlock(&_lock);
+}
+
+- (void)stopIfGenerationUnchanged:(int32_t)gen {
+    // 只有在「期间没有新动画」时才停；否则会把刚起来的动画掐掉
+    if (__atomic_load_n(&_generation, __ATOMIC_SEQ_CST) != gen) { return; }
+    if (_link && CVDisplayLinkIsRunning(_link)) { CVDisplayLinkStop(_link); }
+}
+
+- (void)deliverFinished:(NSArray<NSNumber *> *)finished {
+    if (finished.count == 0) { return; }
+    HSAnimDriver *d = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        lua_State *L = d.L;
+        if (!L || d.finishRef == LUA_NOREF) { return; }
+        int top = lua_gettop(L);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, d.finishRef);
+        if (lua_isfunction(L, -1)) {
+            lua_newtable(L);
+            int i = 1;
+            for (NSNumber *n in finished) {
+                lua_pushinteger(L, (lua_Integer)n.intValue);
+                lua_rawseti(L, -2, i++);
+            }
+            LuaSkin *skin = [LuaSkin sharedWithState:L];
+            [skin protectedCallAndTraceback:1 nresults:0];
+        }
+        lua_settop(L, top);
+    });
+}
+
+- (void)step {
+    NSMutableArray<HSAnimItem *> *newList = nil;
+    os_unfair_lock_lock(&_lock);
+    if (_incoming) {
+        newList = _incoming;
+        _incoming = nil;
+        [_cancelled removeAllObjects];
+    }
+    os_unfair_lock_unlock(&_lock);
+    if (newList) {
+        _items = newList;
+        _freshList = YES;
+    }
+
+    if (_items.count == 0) {
+        __atomic_store_n(&_activeCount, 0, __ATOMIC_SEQ_CST);
+        int32_t gen = __atomic_load_n(&_generation, __ATOMIC_SEQ_CST);
+        HSAnimDriver *d = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [d stopIfGenerationUnchanged:gen]; });
+        return;
+    }
+
+    // 进度用「自己量的 delta」推进，不跨时钟假设 Lua 的时间基准
+    double now = hsAnimNow();
+    double delta = (_lastTick > 0.0) ? (now - _lastTick) : 0.0;
+    if (delta < 0.0 || delta > 0.1) { delta = 0.0; }
+    _lastTick = now;
+    if (_freshList) { delta = 0.0; _freshList = NO; }   // 新表刚由 Lua 摆好，这一拍不推进
+
+    NSMutableArray<HSAnimItem *> *keep = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *finished = nil;
+
+    for (HSAnimItem *it in _items) {
+        it.elapsed += delta;
+        double r = hsAnimQuadOut(it.elapsed, it.duration);
+        NSRect target;
+        BOOL finalFrame = (r >= 1.0);
+        if (finalFrame) {
+            target = it.to;
+        } else {
+            target.origin.x = it.from.origin.x + (it.to.origin.x - it.from.origin.x) * r;
+            target.origin.y = it.from.origin.y + (it.to.origin.y - it.from.origin.y) * r;
+            target.size.width  = it.from.size.width  + (it.to.size.width  - it.from.size.width)  * r;
+            target.size.height = it.from.size.height + (it.to.size.height - it.from.size.height) * r;
+        }
+
+        os_unfair_lock_lock(&_lock);
+        BOOL skip = [_cancelled containsObject:@(it.windowID)];
+        if (!skip) { hsAnimWriteFrame(it.element, target, finalFrame || it.sizeChanges); }
+        os_unfair_lock_unlock(&_lock);
+
+        if (skip) { continue; }
+        if (finalFrame) {
+            if (!finished) { finished = [NSMutableArray array]; }
+            [finished addObject:@(it.windowID)];
+        } else {
+            [keep addObject:it];
+        }
+    }
+
+    _items = keep;
+    __atomic_store_n(&_activeCount, (int32_t)_items.count, __ATOMIC_SEQ_CST);
+
+    if (finished) { [self deliverFinished:finished]; }
+
+    if (_items.count == 0) {
+        int32_t gen = __atomic_load_n(&_generation, __ATOMIC_SEQ_CST);
+        HSAnimDriver *d = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [d stopIfGenerationUnchanged:gen]; });
+    }
+}
+
+@end
+
+static HSAnimDriver *hsAnimDriverShared(void) {
+    static HSAnimDriver *driver = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ driver = [[HSAnimDriver alloc] init]; });
+    return driver;
+}
+
+// 从一个 rect 表里读 x/y/w/h（geometry 表里还有 x1/y1/x2/y2，这里只认前者）
+static NSRect hsAnimRectAt(lua_State *L, int tableIndex, const char *field) {
+    NSRect r = NSMakeRect(0.0, 0.0, 0.0, 0.0);
+    lua_getfield(L, tableIndex, field);
+    if (lua_istable(L, -1)) {
+        int t = lua_gettop(L);
+        lua_getfield(L, t, "x"); if (lua_isnumber(L, -1)) { r.origin.x = lua_tonumber(L, -1); } lua_pop(L, 1);
+        lua_getfield(L, t, "y"); if (lua_isnumber(L, -1)) { r.origin.y = lua_tonumber(L, -1); } lua_pop(L, 1);
+        lua_getfield(L, t, "w"); if (lua_isnumber(L, -1)) { r.size.width = lua_tonumber(L, -1); } lua_pop(L, 1);
+        lua_getfield(L, t, "h"); if (lua_isnumber(L, -1)) { r.size.height = lua_tonumber(L, -1); } lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    return r;
+}
+
+static double hsAnimNumberAt(lua_State *L, int tableIndex, const char *field, double dflt) {
+    double v = dflt;
+    lua_getfield(L, tableIndex, field);
+    if (lua_isnumber(L, -1)) { v = lua_tonumber(L, -1); }
+    lua_pop(L, 1);
+    return v;
+}
+
+/// hs.window._animSync(list) -> none
+/// Function
+/// Hands the complete set of in-flight window animations to the display-link driver
+///
+/// Parameters:
+///  * list - An array of tables, each with `window`, `id`, `from`, `to`, `elapsed` and `duration`
+///
+/// Returns:
+///  * None
+static int window__animsync(lua_State *L) {
+    LuaSkin *skin = [LuaSkin sharedWithState:L];
+    [skin checkArgs:LS_TTABLE, LS_TBREAK];
+
+    NSMutableArray<HSAnimItem *> *list = [NSMutableArray array];
+    lua_Integer n = (lua_Integer)lua_rawlen(L, 1);
+    for (lua_Integer i = 1; i <= n; i++) {
+        lua_rawgeti(L, 1, (int)i);
+        int elem = lua_gettop(L);
+        if (lua_istable(L, elem)) {
+            lua_getfield(L, elem, "window");
+            id obj = [skin toNSObjectAtIndex:(elem + 1)];
+            lua_pop(L, 1);
+            if ([obj isKindOfClass:[HSwindow class]]) {
+                HSwindow *win = (HSwindow *)obj;
+                AXUIElementRef el = win.elementRef;
+                if (el) {
+                    HSAnimItem *it = [[HSAnimItem alloc] init];
+                    it.element = (AXUIElementRef)CFRetain(el);
+                    it.windowID = (int)win.winID;
+                    it.from = hsAnimRectAt(L, elem, "from");
+                    it.to = hsAnimRectAt(L, elem, "to");
+                    it.elapsed = hsAnimNumberAt(L, elem, "elapsed", 0.0);
+                    it.duration = hsAnimNumberAt(L, elem, "duration", 0.0);
+                    it.sizeChanges = (it.from.size.width != it.to.size.width) ||
+                                     (it.from.size.height != it.to.size.height);
+                    [list addObject:it];
+                }
+            }
+        }
+        lua_pop(L, 1);
+    }
+
+    [hsAnimDriverShared() syncWith:list];
+    return 0;
+}
+
+/// hs.window._animCancel(id) -> none
+/// Function
+/// Marks a window's in-flight animation as cancelled so no further frame is written for it
+///
+/// Parameters:
+///  * id - The `hs.window:id()` of the window whose animation should stop
+///
+/// Returns:
+///  * None
+static int window__animcancel(lua_State *L) {
+    LuaSkin *skin = [LuaSkin sharedWithState:L];
+    [skin checkArgs:LS_TNUMBER, LS_TBREAK];
+    [hsAnimDriverShared() cancel:(int)luaL_checkinteger(L, 1)];
+    return 0;
+}
+
+/// hs.window._animActive() -> number
+/// Function
+/// Number of animations the display-link driver is still running
+///
+/// Parameters:
+///  * None
+///
+/// Returns:
+///  * The number of in-flight animations as seen by the driver thread
+static int window__animactive(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)[hsAnimDriverShared() activeCount]);
+    return 1;
+}
+
+/// hs.window._animOnFinish(fn) -> none
+/// Function
+/// Registers the callback the driver calls (on the main thread) with the ids of animations that finished
+///
+/// Parameters:
+///  * fn - A function receiving one argument: an array of finished window ids
+///
+/// Returns:
+///  * None
+static int window__animonfinish(lua_State *L) {
+    LuaSkin *skin = [LuaSkin sharedWithState:L];
+    [skin checkArgs:LS_TFUNCTION, LS_TBREAK];
+    HSAnimDriver *d = hsAnimDriverShared();
+    if (d.finishRef != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, d.finishRef); }
+    lua_pushvalue(L, 1);
+    d.finishRef = luaL_ref(L, LUA_REGISTRYINDEX);
+    d.L = L;
+    return 0;
+}
+
 // Module functions
 static const luaL_Reg moduleLib[] = {
     {"focusedWindow", window_focusedwindow},
@@ -759,6 +1139,10 @@ static const luaL_Reg moduleLib[] = {
     {"snapshotForID", window_snapshotForID},
     {"timeout", window_timeout},
     {"list", window_list},
+    {"_animSync", window__animsync},
+    {"_animCancel", window__animcancel},
+    {"_animActive", window__animactive},
+    {"_animOnFinish", window__animonfinish},
 
     {NULL, NULL}
 };
